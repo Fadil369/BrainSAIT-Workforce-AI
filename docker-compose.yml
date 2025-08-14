@@ -1,0 +1,233 @@
+version: '3.8'
+
+services:
+  # BrainSAIT FastAPI Backend
+  brainsait-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: brainsait-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://brainsait:${POSTGRES_PASSWORD}@postgres:5432/brainsait_workforce
+      - REDIS_URL=redis://redis:6379/0
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ENVIRONMENT=production
+      - SECRET_KEY=${SECRET_KEY}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - SAUDI_MOH_API_KEY=${SAUDI_MOH_API_KEY}
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./backend:/app
+      - ml-models:/app/models
+      - logs:/app/logs
+    networks:
+      - brainsait-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # PostgreSQL Database with Arabic collation
+  postgres:
+    image: postgres:15-alpine
+    container_name: brainsait-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=brainsait_workforce
+      - POSTGRES_USER=brainsait
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --locale=en_US.UTF-8
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./docker/postgres/arabic_collation.sql:/docker-entrypoint-initdb.d/arabic_collation.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - brainsait-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brainsait -d brainsait_workforce"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and sessions
+  redis:
+    image: redis:7-alpine
+    container_name: brainsait-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - brainsait-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Nginx reverse proxy with Arabic font support
+  nginx:
+    image: nginx:alpine
+    container_name: brainsait-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d
+      - ./docker/nginx/ssl:/etc/nginx/ssl
+      - ./docker/nginx/fonts:/usr/share/fonts/truetype
+      - static-files:/var/www/static
+    depends_on:
+      - brainsait-api
+    networks:
+      - brainsait-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ML Models Service (XGBoost, Prophet, etc.)
+  ml-service:
+    build:
+      context: ./docker/ml-models
+      dockerfile: Dockerfile
+    container_name: brainsait-ml
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - MODEL_PATH=/models
+      - REDIS_URL=redis://redis:6379/1
+    volumes:
+      - ml-models:/models
+      - ./backend/predictive_models:/app/predictive_models
+    depends_on:
+      - redis
+    networks:
+      - brainsait-network
+    deploy:
+      resources:
+        reservations:
+          memory: 2G
+        limits:
+          memory: 4G
+
+  # Prometheus monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: brainsait-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - brainsait-network
+
+  # Grafana dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: brainsait-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s:%(http_port)s/grafana/
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/monitoring/grafana:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    networks:
+      - brainsait-network
+
+  # Backup service for database and files
+  backup:
+    image: postgres:15-alpine
+    container_name: brainsait-backup
+    restart: "no"
+    environment:
+      - PGPASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - backup_data:/backup
+      - ./scripts/backup.sh:/backup.sh
+    depends_on:
+      - postgres
+    networks:
+      - brainsait-network
+    entrypoint: ["/backup.sh"]
+
+  # Log aggregation with Fluentd
+  fluentd:
+    build: ./docker/fluentd
+    container_name: brainsait-logs
+    restart: unless-stopped
+    volumes:
+      - logs:/fluentd/log
+      - ./docker/fluentd/fluent.conf:/fluentd/etc/fluent.conf
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    networks:
+      - brainsait-network
+
+  # Cloudflare Tunnel (for secure external access)
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: brainsait-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - nginx
+    networks:
+      - brainsait-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  ml-models:
+    driver: local
+  static-files:
+    driver: local
+  grafana_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  backup_data:
+    driver: local
+  logs:
+    driver: local
+
+networks:
+  brainsait-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
